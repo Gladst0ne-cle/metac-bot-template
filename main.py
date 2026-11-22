@@ -1,13 +1,10 @@
 import argparse
 import asyncio
 import logging
-import re
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Literal
 
 import dotenv
-import requests
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
@@ -17,6 +14,7 @@ from bot_helpers import (
     print_startup_banner,
     silence_noisy_dependencies,
 )
+from free_research import build_free_research_report
 
 silence_noisy_dependencies()
 
@@ -49,39 +47,6 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 _PAID_LLM_ENV_VARS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
-
-
-def _fetch_free_news_rss(
-    question_text: str, max_items: int = 8, max_chars: int = 3200
-) -> str:
-    """Fetch recent news headlines via Google News RSS without external API keys."""
-    tokens = re.sub(r"[^A-Za-z0-9\s\-]", " ", question_text).split()
-    query = " ".join(tokens[:14])[:120].strip()
-    if not query:
-        return ""
-    try:
-        resp = requests.get(
-            "https://news.google.com/rss/search",
-            params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-        lines: list[str] = []
-        for item in root.findall(".//item")[:max_items]:
-            title = (item.findtext("title") or "").strip()
-            pub_date = (item.findtext("pubDate") or "").strip()
-            source = (item.findtext("source") or "").strip()
-            if not title:
-                continue
-            src_suffix = f" ({source})" if source else ""
-            date_prefix = f"[{pub_date}] " if pub_date else ""
-            lines.append(f"- {date_prefix}{title}{src_suffix}")
-        return "\n".join(lines)[:max_chars]
-    except Exception as exc:
-        logger.warning(f"Free Google News RSS search failed: {exc}")
-        return ""
 
 
 def _build_runtime_config() -> tuple[
@@ -124,7 +89,7 @@ def _build_runtime_config() -> tuple[
                     fallbacks=["gemini/gemini-3.6-flash"],
                 ),
             },
-            2,
+            3,
             1,
             False,
         )
@@ -152,7 +117,7 @@ def _build_runtime_config() -> tuple[
                     allowed_tries=4,
                 ),
             },
-            2,
+            3,
             1,
             False,
         )
@@ -240,6 +205,10 @@ class FallTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+    as_of_date: str | None = None
+
+    def _today_str(self) -> str:
+        return self.as_of_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     ##################################### RESEARCH #####################################
 
@@ -272,8 +241,13 @@ class FallTemplateBot2026(ForecastBot):
                 )
                 research = await searcher.invoke(prompt)
             elif researcher == "free-news-rss":
-                research = await asyncio.to_thread(
-                    _fetch_free_news_rss, question.question_text
+                research = await build_free_research_report(
+                    question_text=question.question_text,
+                    resolution_criteria=question.resolution_criteria or "",
+                    fine_print=question.fine_print or "",
+                    background_info=question.background_info or "",
+                    planner_llm=self.get_llm("parser", "llm"),
+                    as_of_date=self.as_of_date,
                 )
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
@@ -332,15 +306,14 @@ class FallTemplateBot2026(ForecastBot):
             Your research assistant says:
             {research}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Today is {self._today_str()}.
 
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A brief description of a scenario that results in a No outcome.
-            (d) A brief description of a scenario that results in a Yes outcome.
-
-            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+            Follow disciplined superforecasting methodology before giving your probability:
+            (a) Resolution & time horizon: summarize exact resolution criteria, edge cases, and time left until resolution.
+            (b) Outside view & market anchor: estimate the historical base rate for this class of event. If external prediction markets appear in the research dossier, use them as a rough starting anchor ONLY after adjusting for differences in wording, resolution criteria, or closing dates.
+            (c) Inside view update: weigh the latest primary data, official macro figures, and recent news headlines above (distinguishing confirmed facts from speculation).
+            (d) Pre-mortem: state the strongest realistic case for No and the strongest realistic case for Yes.
+            (e) Calibration check: avoid extreme probabilities (<3% or >97%) unless mechanically or legally near-certain, remembering the status quo carries inertia.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -402,15 +375,15 @@ class FallTemplateBot2026(ForecastBot):
             Your research assistant says:
             {research}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Today is {self._today_str()}.
 
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A description of a scenario that results in an unexpected outcome.
+            Follow disciplined superforecasting methodology before assigning probabilities:
+            (a) Resolution & time horizon: audit exact option definitions, mutual exclusivity, and time remaining until resolution.
+            (b) Outside view & market anchor: estimate base rates across options; if external prediction markets appear in the research dossier, anchor loosely only after checking wording and scope alignment.
+            (c) Inside view update: weigh the primary sources, official data, and recent headlines, plus describe an unexpected scenario.
+            (d) Calibration check: weight status quo continuity, reserve nonzero tail probability on plausible upset/residual options, and make sure the probabilities across all options {question.options} sum cleanly to 100%.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
 
             The last thing you write is your final probabilities for the N options in this order {question.options} as:
             Option_A: Probability_A
@@ -480,7 +453,7 @@ class FallTemplateBot2026(ForecastBot):
             Your research assistant says:
             {research}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Today is {self._today_str()}.
 
             {lower_bound_message}
             {upper_bound_message}
@@ -488,18 +461,15 @@ class FallTemplateBot2026(ForecastBot):
             Formatting Instructions:
             - Please notice the units requested and give your answer in these units (e.g. whether you represent a number as 1,000,000 or 1 million).
             - Never use scientific notation.
-            - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
+            - Always start with a smaller number (more negative if negative) and then increase strictly monotonically (`Percentile 10 < Percentile 20 < Percentile 40 < Percentile 60 < Percentile 80 < Percentile 90`).
 
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            Follow disciplined quantitative superforecasting before setting percentiles:
+            (a) Baseline & hard floor/anchor: identify the latest observed value or cumulative year-to-date count from primary sources or FRED data above, plus time remaining until resolution.
+            (b) Status quo & trend extrapolation: what happens if current rate/trend persists over the remaining horizon?
+            (c) Expert / market expectations and historical variance over similar horizons.
+            (d) Tail scenarios & calibration: describe a concrete downside surprise (driving P10/P20) and upside shock (driving P80/P90), ensuring genuinely wide 90/10 intervals to protect log score against unexpected tails.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
             The last thing you write is your final answer as:
             "
@@ -574,7 +544,7 @@ class FallTemplateBot2026(ForecastBot):
             Your research assistant says:
             {research}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Today is {self._today_str()}.
 
             {lower_bound_message}
             {upper_bound_message}
@@ -582,19 +552,15 @@ class FallTemplateBot2026(ForecastBot):
             Formatting Instructions:
             - This is a date question, and as such, the answer must be expressed in terms of dates.
             - The dates must be written in the format of YYYY-MM-DD. If hours matter, please append the date with the hour in UTC and military time: YYYY-MM-DDTHH:MM:SSZ. No other formatting is allowed.
-            - Always start with a lower date chronologically and then increase from there.
-            - Do NOT forget this. The dates must be written in chronological order starting at the earliest time at percentile 10 and increasing from there.
+            - Always start with a lower date chronologically and then increase strictly (`Percentile 10 < Percentile 20 < Percentile 40 < Percentile 60 < Percentile 80 < Percentile 90`).
 
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            Follow disciplined chronological superforecasting before setting percentiles:
+            (a) Baseline & calendar anchor: note current progress/milestones from primary sources or news above, scheduled deadlines, and time elapsed.
+            (b) Outside view: historical timelines and base rates for comparable milestones or regulatory/political processes.
+            (c) Expert / market expectations and potential acceleration vs delay bottlenecks.
+            (d) Tail scenarios & calibration: describe an early-resolution surprise (P10/P20) and a prolonged-delay scenario (P80/P90), keeping a wide 90/10 interval against unknown delays.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
             The last thing you write is your final answer as:
             "
