@@ -105,22 +105,23 @@ def _build_runtime_config() -> tuple[
         return (
             {
                 "default": GeneralLlm(
-                    model="gemini/gemini-3.8-flash",
+                    model="gemini/gemini-3.6-flash",
                     timeout=90,
                     allowed_tries=4,
+                    fallbacks=["gemini/gemini-3.5-flash-lite"],
                 ),
                 "summarizer": GeneralLlm(
-                    model="gemini/gemini-2.5-flash",
-                    temperature=0.1,
+                    model="gemini/gemini-3.5-flash-lite",
                     timeout=60,
                     allowed_tries=4,
+                    fallbacks=["gemini/gemini-3.6-flash"],
                 ),
                 "researcher": researcher,
                 "parser": GeneralLlm(
-                    model="gemini/gemini-2.5-flash",
-                    temperature=0.1,
+                    model="gemini/gemini-3.5-flash-lite",
                     timeout=60,
                     allowed_tries=4,
+                    fallbacks=["gemini/gemini-3.6-flash"],
                 ),
             },
             2,
