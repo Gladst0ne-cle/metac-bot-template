@@ -86,7 +86,7 @@ def extract_primary_urls(text: str, max_urls: int = 2) -> list[str]:
     return urls
 
 
-def fetch_primary_url_excerpt(url: str, max_chars: int = 1400) -> str:
+def fetch_primary_url_excerpt(url: str, max_chars: int = 900) -> str:
     """Fetch a public resolution/reference webpage and extract clean plain text."""
     if not _is_safe_public_url(url):
         return ""
@@ -136,8 +136,8 @@ def _parse_rss_datetime(pub_date: str) -> datetime | None:
 def fetch_google_news_rss(
     queries: list[str],
     as_of_date: str | None = None,
-    max_items: int = 12,
-    max_chars: int = 3800,
+    max_items: int = 10,
+    max_chars: int = 2200,
 ) -> str:
     """Fetch deduplicated Google News RSS items with optional strict as_of_date filter."""
     collected: list[tuple[float, str, str, str]] = []
@@ -265,12 +265,14 @@ def _format_polymarket_hit(m: dict[str, Any]) -> str | None:
         pairs = ", ".join(
             f"{o}={float(p) * 100:.1f}%" for o, p in list(zip(outcomes, prices))[:4]
         )
-        return f"- [Polymarket | vol=${vol:,.0f}] {q_title}: {pairs}"
+        end_date = str(m.get("endDate") or "")[:10]
+        end_tag = f" | ends={end_date}" if end_date else ""
+        return f"- [Polymarket | vol=${vol:,.0f}{end_tag}] {q_title}: {pairs}"
     except Exception:
         return None
 
 
-def fetch_prediction_markets(query: str, max_chars: int = 1600) -> str:
+def fetch_prediction_markets(query: str, max_chars: int = 1000) -> str:
     """Query Polymarket and Manifold public APIs for live market odds."""
     q = (query or "").strip()[:100]
     if not q:
@@ -312,8 +314,17 @@ def fetch_prediction_markets(query: str, max_chars: int = 1600) -> str:
             prob = m.get("probability")
             bettors = m.get("uniqueBettorCount") or 0
             if title and prob is not None and bettors >= 5:
+                close_ms = m.get("closeTime")
+                end_tag = ""
+                if isinstance(close_ms, (int, float)) and close_ms > 0:
+                    try:
+                        end_tag = " | ends=" + datetime.fromtimestamp(
+                            float(close_ms) / 1000.0, tz=timezone.utc
+                        ).strftime("%Y-%m-%d")
+                    except (OverflowError, OSError, ValueError):
+                        end_tag = ""
                 lines.append(
-                    f"- [Manifold | {bettors} traders] {title}: Yes={float(prob) * 100:.1f}%"
+                    f"- [Manifold | {bettors} traders{end_tag}] {title}: Yes={float(prob) * 100:.1f}%"
                 )
     except Exception as exc:
         logger.debug(f"Manifold search failed ({q}): {exc}")
@@ -321,7 +332,7 @@ def fetch_prediction_markets(query: str, max_chars: int = 1600) -> str:
     return "\n".join(lines)[:max_chars]
 
 
-def fetch_wikipedia_summary(query: str, max_chars: int = 900) -> str:
+def fetch_wikipedia_summary(query: str, max_chars: int = 550) -> str:
     """Fetch top matching Wikipedia article intro summary."""
     q = (query or "").strip()[:100]
     if not q:
@@ -424,7 +435,7 @@ async def build_free_research_report(
     background_info: str,
     planner_llm: Any | None = None,
     as_of_date: str | None = None,
-    max_total_chars: int = 9000,
+    max_total_chars: int = 5200,
 ) -> str:
     """Build a multi-source zero-cost research dossier with strict point-in-time safety."""
     plan = await _plan_queries(question_text, resolution_criteria, planner_llm)
@@ -460,24 +471,44 @@ async def build_free_research_report(
         k: (r if isinstance(r, str) else "") for k, r in zip(keys, results)
     }
 
-    sections: list[str] = []
     url_blocks = [
         f"Source ({primary_urls[i]}):\n{outputs[f'url_{i}']}"
         for i in range(len(primary_urls))
         if outputs.get(f"url_{i}")
     ]
+    ordered_sections: list[str] = []
     if url_blocks:
-        sections.append("### Primary Resolution / Reference Pages\n" + "\n\n".join(url_blocks))
+        ordered_sections.append(
+            "### Primary Resolution / Reference Pages\n"
+            + "\n\n".join(url_blocks)[:1850]
+        )
     if outputs.get("fred"):
-        sections.append("### Official Macro Data (FRED)\n" + outputs["fred"])
-    if outputs.get("news"):
-        sections.append("### Recent News Headlines (Google News RSS)\n" + outputs["news"])
+        ordered_sections.append(
+            "### Official Macro Data (FRED)\n" + outputs["fred"][:600]
+        )
     if outputs.get("markets"):
-        sections.append(
+        ordered_sections.append(
             "### External Prediction Market Benchmarks (Verify Criteria Match)\n"
-            + outputs["markets"]
+            + outputs["markets"][:1000]
+        )
+    if outputs.get("news"):
+        ordered_sections.append(
+            "### Recent News Headlines (Google News RSS)\n" + outputs["news"][:2200]
         )
     if outputs.get("wiki"):
-        sections.append("### Background Reference (Wikipedia)\n" + outputs["wiki"])
+        ordered_sections.append(
+            "### Background Reference (Wikipedia)\n" + outputs["wiki"][:550]
+        )
 
-    return "\n\n".join(sections)[:max_total_chars]
+    final_sections: list[str] = []
+    used = 0
+    for sec in ordered_sections:
+        sep = 2 if final_sections else 0
+        remaining = max_total_chars - used - sep
+        if remaining <= 40:
+            break
+        clipped = sec[:remaining]
+        final_sections.append(clipped)
+        used += sep + len(clipped)
+
+    return "\n\n".join(final_sections)[:max_total_chars]

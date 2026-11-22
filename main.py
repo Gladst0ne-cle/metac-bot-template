@@ -1,6 +1,9 @@
 import argparse
 import asyncio
 import logging
+import math
+import re
+import time
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -36,6 +39,7 @@ from forecasting_tools import (
     PredictionTypes,
     PredictionAffirmed,
     BinaryPrediction,
+    PredictedOption,
     PredictedOptionList,
     ReasonedPrediction,
     SmartSearcher,
@@ -47,6 +51,108 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 _PAID_LLM_ENV_VARS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+
+_FORECAST_LENSES: tuple[str, str, str] = (
+    "Analytical Lens (Balanced Synthesis): Give equal weight to outside-view base rates and inside-view primary evidence, explicitly checking status-quo inertia.",
+    "Analytical Lens (Skeptical Red-Team): Anchor strictly on historical base rates and institutional friction; challenge hype and detail concrete reasons consensus headlines could disappoint or slip past the deadline.",
+    "Analytical Lens (Signal Update): Prioritize the freshest primary facts, official data trends, and aligned prediction-market benchmarks (strictly after checking wording and closing-date alignment).",
+)
+
+
+def _clip_text(text: str | None, max_chars: int) -> str:
+    """Trim oversized prompt text while keeping both opening and closing rules."""
+    s = (text or "").strip()
+    if max_chars <= 0 or len(s) <= max_chars:
+        return s
+    marker = "\n...[truncated]...\n"
+    if max_chars <= len(marker) + 10:
+        return s[:max_chars]
+    head = max_chars * 2 // 3
+    tail = max_chars - head - len(marker)
+    return f"{s[:head]}{marker}{s[-tail:]}" if tail > 0 else s[:max_chars]
+
+
+_BINARY_PROB_TAIL_RE = re.compile(
+    r"(?i)probability\s*[:=]\s*\*{0,2}\s*(\d+(?:\.\d+)?)\s*%\s*\*{0,2}"
+)
+
+
+def _extract_binary_probability_from_tail(reasoning: str) -> float | None:
+    """Parse an unambiguous final 'Probability: ZZ%' value near the end of reasoning."""
+    tail = (reasoning or "").strip()[-260:]
+    matches = _BINARY_PROB_TAIL_RE.findall(tail)
+    if len(matches) != 1:
+        return None
+    val = float(matches[0])
+    if 0.0 <= val <= 100.0:
+        return val / 100.0
+    return None
+
+
+def _aggregate_binary_log_odds(
+    predictions: list[float],
+    clip_min: float = 0.015,
+    clip_max: float = 0.985,
+) -> float:
+    """Average clipped logits across samples to calibrate log score and prevent 0/1 overconfidence."""
+    if not predictions:
+        raise ValueError("Cannot aggregate empty list of binary predictions")
+    logits = []
+    for raw_p in predictions:
+        p = max(clip_min, min(clip_max, float(raw_p)))
+        logits.append(math.log(p / (1.0 - p)))
+    mean_logit = sum(logits) / len(logits)
+    pooled = 1.0 / (1.0 + math.exp(-mean_logit))
+    return max(clip_min, min(clip_max, pooled))
+
+
+def _aggregate_multiple_choice_log_pool(
+    predictions: list[PredictedOptionList],
+) -> PredictedOptionList:
+    """Geometric-mean (logarithmic opinion pool) aggregation across multiple-choice samples."""
+    if not predictions:
+        raise ValueError("Cannot aggregate empty list of multiple-choice predictions")
+    option_names = [opt.option_name for opt in predictions[0].predicted_options]
+    if not option_names:
+        raise ValueError("Multiple-choice prediction has no options")
+    expected_set = set(option_names)
+    if len(expected_set) != len(option_names):
+        raise ValueError("Duplicate option names in multiple-choice prediction")
+
+    maps: list[dict[str, float]] = []
+    for pred_list in predictions:
+        if len(pred_list.predicted_options) != len(option_names):
+            raise ValueError("Inconsistent option counts across samples")
+        opt_map = {opt.option_name: opt.probability for opt in pred_list.predicted_options}
+        if set(opt_map.keys()) != expected_set:
+            raise ValueError("Inconsistent option names across samples")
+        maps.append(opt_map)
+
+    n_opts = len(option_names)
+    eps = min(0.005, 0.25 / max(1, n_opts))
+    geo_means = [
+        math.exp(sum(math.log(max(eps, float(m[name]))) for m in maps) / len(maps))
+        for name in option_names
+    ]
+    total = sum(geo_means)
+    if total <= 0.0 or not math.isfinite(total):
+        geo_means = [1.0 / n_opts] * n_opts
+
+    floor = 0.001
+    if floor * n_opts < 1.0:
+        probs = PredictedOptionList._normalize_with_minimum(
+            geo_means, minimum_probability=floor
+        )
+    else:
+        s = sum(geo_means)
+        probs = [g / s for g in geo_means]
+
+    return PredictedOptionList(
+        predicted_options=[
+            PredictedOption(option_name=name, probability=p)
+            for name, p in zip(option_names, probs)
+        ]
+    )
 
 
 def _build_runtime_config() -> tuple[
@@ -221,9 +327,61 @@ class FallTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
     as_of_date: str | None = None
+    _min_llm_call_interval: float = 3.0
 
     def _today_str(self) -> str:
         return self.as_of_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _get_prediction_limiter(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        limiters = getattr(self, "_loop_limiters", None)
+        if limiters is None:
+            limiters = {}
+            self._loop_limiters = limiters
+        sem = limiters.get(loop)
+        if sem is None:
+            sem = asyncio.Semaphore(1)
+            limiters[loop] = sem
+        return sem
+
+    def _next_lens_instruction(self, question: MetaculusQuestion) -> str:
+        counters = getattr(self, "_lens_counters", None)
+        if counters is None:
+            counters = {}
+            self._lens_counters = counters
+        key = str(getattr(question, "id_of_question", None) or question.question_text)
+        idx = counters.get(key, 0)
+        counters[key] = idx + 1
+        return _FORECAST_LENSES[idx % len(_FORECAST_LENSES)]
+
+    async def _invoke_default_llm(self, prompt: str) -> str:
+        async with self._get_prediction_limiter():
+            interval = max(0.0, float(getattr(self, "_min_llm_call_interval", 0.0)))
+            last_ts = float(getattr(self, "_last_default_call_ts", 0.0))
+            if last_ts > 0.0 and interval > 0.0:
+                wait = interval - (time.monotonic() - last_ts)
+                if wait > 0.0:
+                    await asyncio.sleep(wait)
+            try:
+                return await self.get_llm("default", "llm").invoke(prompt)
+            finally:
+                self._last_default_call_ts = time.monotonic()
+
+    async def _aggregate_predictions(
+        self,
+        predictions: list[PredictionTypes],
+        question: MetaculusQuestion,
+    ) -> PredictionTypes:
+        if isinstance(question, BinaryQuestion):
+            return _aggregate_binary_log_odds([float(p) for p in predictions])
+        if isinstance(question, MultipleChoiceQuestion):
+            try:
+                return _aggregate_multiple_choice_log_pool(predictions)  # type: ignore[arg-type]
+            except ValueError as exc:
+                logger.warning(
+                    f"Falling back to default MC aggregation for {question.page_url}: {exc}"
+                )
+        return await super()._aggregate_predictions(predictions, question)
 
     ##################################### RESEARCH #####################################
 
@@ -301,6 +459,7 @@ class FallTemplateBot2026(ForecastBot):
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
+        lens_note = self._next_lens_instruction(question)
         prompt = clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
@@ -309,19 +468,21 @@ class FallTemplateBot2026(ForecastBot):
             {question.question_text}
 
             Question background:
-            {question.background_info}
+            {_clip_text(question.background_info, 1600)}
 
 
             This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
-            {question.resolution_criteria}
+            {_clip_text(question.resolution_criteria, 2000)}
 
-            {question.fine_print}
+            {_clip_text(question.fine_print, 1000)}
 
 
             Your research assistant says:
-            {research}
+            {_clip_text(research, 5200)}
 
             Today is {self._today_str()}.
+
+            {lens_note}
 
             Follow disciplined superforecasting methodology before giving your probability:
             (a) Resolution & time horizon: summarize exact resolution criteria, edge cases, and time left until resolution.
@@ -331,6 +492,7 @@ class FallTemplateBot2026(ForecastBot):
             (e) Calibration check: avoid extreme probabilities (<3% or >97%) unless mechanically or legally near-certain, remembering the status quo carries inertia.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
+            Keep your reasoning structured and concise (under ~350 words).
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
             """
         )
@@ -342,22 +504,40 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_default_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        parsing_instructions = clean_indents(
-            f"""
-            The text given to you is trying to give a probability forecast for a binary question.
-            {self._create_resolved_question_parsing_message()}
-            """
-        )
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning,
-            BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-            additional_instructions=parsing_instructions,
-        )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        raw_pred = _extract_binary_probability_from_tail(reasoning)
+        if raw_pred is None:
+            parsing_instructions = clean_indents(
+                f"""
+                The text given to you is trying to give a probability forecast for a binary question.
+                {self._create_resolved_question_parsing_message()}
+                """
+            )
+            try:
+                binary_prediction: BinaryPrediction = await structure_output(
+                    reasoning,
+                    BinaryPrediction,
+                    model=self.get_llm("parser", "llm"),
+                    num_validation_samples=self._structure_output_validation_samples,
+                    additional_instructions=parsing_instructions,
+                )
+                raw_pred = float(binary_prediction.prediction_in_decimal)
+            except ValueError:
+                valid_vals = [
+                    float(m)
+                    for m in _BINARY_PROB_TAIL_RE.findall(reasoning or "")
+                    if 0.0 <= float(m) <= 100.0
+                ]
+                if not valid_vals:
+                    raise
+                logger.warning(
+                    f"structure_output rejected binary reasoning for {question.page_url}; "
+                    "falling back to explicit Probability match."
+                )
+                raw_pred = valid_vals[-1] / 100.0
+
+        decimal_pred = max(0.01, min(0.99, raw_pred))
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
@@ -369,6 +549,7 @@ class FallTemplateBot2026(ForecastBot):
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
+        lens_note = self._next_lens_instruction(question)
         prompt = clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
@@ -380,17 +561,19 @@ class FallTemplateBot2026(ForecastBot):
 
 
             Background:
-            {question.background_info}
+            {_clip_text(question.background_info, 1600)}
 
-            {question.resolution_criteria}
+            {_clip_text(question.resolution_criteria, 2000)}
 
-            {question.fine_print}
+            {_clip_text(question.fine_print, 1000)}
 
 
             Your research assistant says:
-            {research}
+            {_clip_text(research, 5200)}
 
             Today is {self._today_str()}.
+
+            {lens_note}
 
             Follow disciplined superforecasting methodology before assigning probabilities:
             (a) Resolution & time horizon: audit exact option definitions, mutual exclusivity, and time remaining until resolution.
@@ -400,6 +583,7 @@ class FallTemplateBot2026(ForecastBot):
 
             {self._get_conditional_disclaimer_if_necessary(question)}
 
+            Keep your reasoning structured and concise (under ~350 words).
             The last thing you write is your final probabilities for the N options in this order {question.options} as:
             Option_A: Probability_A
             Option_B: Probability_B
@@ -424,7 +608,7 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_default_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
@@ -449,6 +633,7 @@ class FallTemplateBot2026(ForecastBot):
         upper_bound_message, lower_bound_message = (
             self._create_upper_and_lower_bound_messages(question)
         )
+        lens_note = self._next_lens_instruction(question)
         prompt = clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
@@ -457,18 +642,20 @@ class FallTemplateBot2026(ForecastBot):
             {question.question_text}
 
             Background:
-            {question.background_info}
+            {_clip_text(question.background_info, 1600)}
 
-            {question.resolution_criteria}
+            {_clip_text(question.resolution_criteria, 2000)}
 
-            {question.fine_print}
+            {_clip_text(question.fine_print, 1000)}
 
             Units for answer: {question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"}
 
             Your research assistant says:
-            {research}
+            {_clip_text(research, 5200)}
 
             Today is {self._today_str()}.
+
+            {lens_note}
 
             {lower_bound_message}
             {upper_bound_message}
@@ -486,6 +673,7 @@ class FallTemplateBot2026(ForecastBot):
 
             {self._get_conditional_disclaimer_if_necessary(question)}
 
+            Keep your reasoning structured and concise (under ~350 words).
             The last thing you write is your final answer as:
             "
             Percentile 10: XX (lowest number value)
@@ -504,7 +692,7 @@ class FallTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_default_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -542,6 +730,7 @@ class FallTemplateBot2026(ForecastBot):
         upper_bound_message, lower_bound_message = (
             self._create_upper_and_lower_bound_messages(question)
         )
+        lens_note = self._next_lens_instruction(question)
         prompt = clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
@@ -550,16 +739,18 @@ class FallTemplateBot2026(ForecastBot):
             {question.question_text}
 
             Background:
-            {question.background_info}
+            {_clip_text(question.background_info, 1600)}
 
-            {question.resolution_criteria}
+            {_clip_text(question.resolution_criteria, 2000)}
 
-            {question.fine_print}
+            {_clip_text(question.fine_print, 1000)}
 
             Your research assistant says:
-            {research}
+            {_clip_text(research, 5200)}
 
             Today is {self._today_str()}.
+
+            {lens_note}
 
             {lower_bound_message}
             {upper_bound_message}
@@ -577,6 +768,7 @@ class FallTemplateBot2026(ForecastBot):
 
             {self._get_conditional_disclaimer_if_necessary(question)}
 
+            Keep your reasoning structured and concise (under ~350 words).
             The last thing you write is your final answer as:
             "
             Percentile 10: YYYY-MM-DD (oldest date)
@@ -596,7 +788,7 @@ class FallTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_default_llm(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -821,6 +1013,7 @@ if __name__ == "__main__":
         llms=llms_cfg,
     )
     template_bot._structure_output_validation_samples = validation_samples
+    template_bot._min_llm_call_interval = 0.0 if llms_cfg is None else 3.0
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
