@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import logging
-import os
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -49,7 +48,6 @@ from forecasting_tools import (
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
-_GITHUB_MODELS_BASE = "https://models.github.ai/inference"
 _PAID_LLM_ENV_VARS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
 
 
@@ -107,23 +105,22 @@ def _build_runtime_config() -> tuple[
         return (
             {
                 "default": GeneralLlm(
-                    model="gemini/gemini-2.5-flash",
-                    temperature=0.3,
-                    timeout=60,
-                    allowed_tries=3,
+                    model="gemini/gemini-3.8-flash",
+                    timeout=90,
+                    allowed_tries=4,
                 ),
                 "summarizer": GeneralLlm(
                     model="gemini/gemini-2.5-flash",
                     temperature=0.1,
                     timeout=60,
-                    allowed_tries=3,
+                    allowed_tries=4,
                 ),
                 "researcher": researcher,
                 "parser": GeneralLlm(
                     model="gemini/gemini-2.5-flash",
                     temperature=0.1,
                     timeout=60,
-                    allowed_tries=3,
+                    allowed_tries=4,
                 ),
             },
             2,
@@ -131,34 +128,27 @@ def _build_runtime_config() -> tuple[
             False,
         )
 
-    if is_real_env("GITHUB_TOKEN"):
-        github_token = os.environ["GITHUB_TOKEN"].strip()
+    if is_real_env("GROQ_API_KEY"):
         return (
             {
                 "default": GeneralLlm(
-                    model="openai/openai/gpt-4.1-mini",
-                    api_base=_GITHUB_MODELS_BASE,
-                    api_key=github_token,
+                    model="groq/llama-3.3-70b-versatile",
                     temperature=0.3,
                     timeout=60,
-                    allowed_tries=3,
+                    allowed_tries=4,
                 ),
                 "summarizer": GeneralLlm(
-                    model="openai/openai/gpt-4o-mini",
-                    api_base=_GITHUB_MODELS_BASE,
-                    api_key=github_token,
+                    model="groq/llama-3.1-8b-instant",
                     temperature=0.1,
                     timeout=60,
-                    allowed_tries=3,
+                    allowed_tries=4,
                 ),
                 "researcher": researcher,
                 "parser": GeneralLlm(
-                    model="openai/openai/gpt-4o-mini",
-                    api_base=_GITHUB_MODELS_BASE,
-                    api_key=github_token,
+                    model="groq/llama-3.1-8b-instant",
                     temperature=0.1,
                     timeout=60,
-                    allowed_tries=3,
+                    allowed_tries=4,
                 ),
             },
             2,
@@ -833,7 +823,7 @@ if __name__ == "__main__":
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
     # Configure the bot. When OPENROUTER/OPENAI/ANTHROPIC keys are absent,
-    # _build_runtime_config() selects free Gemini or GitHub Models + RSS.
+    # _build_runtime_config() selects free Gemini or Groq + RSS.
     llms_cfg, preds_per_report, validation_samples, enable_summarize = (
         _build_runtime_config()
     )

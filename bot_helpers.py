@@ -79,13 +79,15 @@ def check_environment(strict: bool = True) -> None:
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
             "GEMINI_API_KEY",
-            "GITHUB_TOKEN",
+            "GROQ_API_KEY",
         )
     )
     if not has_llm_key:
         problems.append(
             "No LLM key set. Set OPENROUTER_API_KEY, OPENAI_API_KEY, "
-            "ANTHROPIC_API_KEY, GEMINI_API_KEY, or GITHUB_TOKEN (GitHub Models)."
+            "ANTHROPIC_API_KEY, GEMINI_API_KEY (free at "
+            "https://aistudio.google.com/apikey), or GROQ_API_KEY (free at "
+            "https://console.groq.com/keys)."
         )
 
     if problems:
