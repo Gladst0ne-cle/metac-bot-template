@@ -67,31 +67,41 @@ def _build_runtime_config() -> tuple[
         researcher = "free-news-rss"
 
     if is_real_env("GEMINI_API_KEY"):
+        has_groq = is_real_env("GROQ_API_KEY")
+        default_fallbacks = [
+            "gemini/gemini-3-flash-preview",
+            "gemini/gemini-3.8-flash",
+            "gemini/gemini-3.5-flash-lite",
+            "gemini/gemini-3.1-flash-lite",
+        ]
+        lite_fallbacks = ["gemini/gemini-3.1-flash-lite"]
+        if has_groq:
+            default_fallbacks.extend(
+                ["groq/openai/gpt-oss-120b", "groq/openai/gpt-oss-20b"]
+            )
+            lite_fallbacks.extend(
+                ["groq/openai/gpt-oss-20b", "groq/openai/gpt-oss-120b"]
+            )
         return (
             {
                 "default": GeneralLlm(
                     model="gemini/gemini-3.6-flash",
                     timeout=90,
                     allowed_tries=4,
-                    fallbacks=[
-                        "gemini/gemini-3-flash-preview",
-                        "gemini/gemini-3.8-flash",
-                        "gemini/gemini-3.5-flash-lite",
-                        "gemini/gemini-3.1-flash-lite",
-                    ],
+                    fallbacks=default_fallbacks,
                 ),
                 "summarizer": GeneralLlm(
                     model="gemini/gemini-3.5-flash-lite",
                     timeout=60,
                     allowed_tries=4,
-                    fallbacks=["gemini/gemini-3.1-flash-lite"],
+                    fallbacks=lite_fallbacks,
                 ),
                 "researcher": researcher,
                 "parser": GeneralLlm(
                     model="gemini/gemini-3.5-flash-lite",
                     timeout=60,
                     allowed_tries=4,
-                    fallbacks=["gemini/gemini-3.1-flash-lite"],
+                    fallbacks=list(lite_fallbacks),
                 ),
             },
             3,
@@ -103,23 +113,23 @@ def _build_runtime_config() -> tuple[
         return (
             {
                 "default": GeneralLlm(
-                    model="groq/llama-3.3-70b-versatile",
-                    temperature=0.3,
-                    timeout=60,
+                    model="groq/openai/gpt-oss-120b",
+                    timeout=90,
                     allowed_tries=4,
+                    fallbacks=["groq/openai/gpt-oss-20b"],
                 ),
                 "summarizer": GeneralLlm(
-                    model="groq/llama-3.1-8b-instant",
-                    temperature=0.1,
+                    model="groq/openai/gpt-oss-20b",
                     timeout=60,
                     allowed_tries=4,
+                    fallbacks=["groq/openai/gpt-oss-120b"],
                 ),
                 "researcher": researcher,
                 "parser": GeneralLlm(
-                    model="groq/llama-3.1-8b-instant",
-                    temperature=0.1,
+                    model="groq/openai/gpt-oss-20b",
                     timeout=60,
                     allowed_tries=4,
+                    fallbacks=["groq/openai/gpt-oss-120b"],
                 ),
             },
             3,
