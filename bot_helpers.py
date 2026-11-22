@@ -26,9 +26,13 @@ _PLACEHOLDER_ENV_VALUES = {
 }
 
 
-def _is_real_env(name: str) -> bool:
+def is_real_env(name: str) -> bool:
+    """Return True if an environment variable is set to a non-placeholder value."""
     val = os.getenv(name)
     return bool(val and val.strip() and val.strip() not in _PLACEHOLDER_ENV_VALUES)
+
+
+_is_real_env = is_real_env
 
 
 def silence_noisy_dependencies() -> None:
@@ -69,15 +73,19 @@ def check_environment(strict: bool = True) -> None:
         )
 
     has_llm_key = any(
-        _is_real_env(k)
-        for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+        is_real_env(k)
+        for k in (
+            "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GITHUB_TOKEN",
+        )
     )
     if not has_llm_key:
         problems.append(
-            "No LLM key set. Set OPENROUTER_API_KEY, OPENAI_API_KEY or "
-            "ANTHROPIC_API_KEY (free OpenRouter credits: "
-            "https://forms.gle/aQdYMq9Pisrf1v7d8). The Metaculus LLM proxy that "
-            "the bot used to fall back to is no longer available."
+            "No LLM key set. Set OPENROUTER_API_KEY, OPENAI_API_KEY, "
+            "ANTHROPIC_API_KEY, GEMINI_API_KEY, or GITHUB_TOKEN (GitHub Models)."
         )
 
     if problems:

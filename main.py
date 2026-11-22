@@ -1,14 +1,19 @@
 import argparse
 import asyncio
 import logging
+import os
+import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Literal
 
 import dotenv
+import requests
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
     check_environment,
+    is_real_env,
     print_run_summary_banner,
     print_startup_banner,
     silence_noisy_dependencies,
@@ -43,6 +48,125 @@ from forecasting_tools import (
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+_GITHUB_MODELS_BASE = "https://models.github.ai/inference"
+_PAID_LLM_ENV_VARS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+
+
+def _fetch_free_news_rss(
+    question_text: str, max_items: int = 8, max_chars: int = 3200
+) -> str:
+    """Fetch recent news headlines via Google News RSS without external API keys."""
+    tokens = re.sub(r"[^A-Za-z0-9\s\-]", " ", question_text).split()
+    query = " ".join(tokens[:14])[:120].strip()
+    if not query:
+        return ""
+    try:
+        resp = requests.get(
+            "https://news.google.com/rss/search",
+            params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        lines: list[str] = []
+        for item in root.findall(".//item")[:max_items]:
+            title = (item.findtext("title") or "").strip()
+            pub_date = (item.findtext("pubDate") or "").strip()
+            source = (item.findtext("source") or "").strip()
+            if not title:
+                continue
+            src_suffix = f" ({source})" if source else ""
+            date_prefix = f"[{pub_date}] " if pub_date else ""
+            lines.append(f"- {date_prefix}{title}{src_suffix}")
+        return "\n".join(lines)[:max_chars]
+    except Exception as exc:
+        logger.warning(f"Free Google News RSS search failed: {exc}")
+        return ""
+
+
+def _build_runtime_config() -> tuple[
+    dict[str, str | GeneralLlm | None] | None, int, int, bool
+]:
+    """
+    Select LLMs and sampling parameters based on available credentials.
+    Returns (llms, predictions_per_research_report, validation_samples, enable_summarize).
+    """
+    if any(is_real_env(k) for k in _PAID_LLM_ENV_VARS):
+        return (None, 5, 2, True)
+
+    if is_real_env("ASKNEWS_CLIENT_ID") and is_real_env("ASKNEWS_SECRET"):
+        researcher: str | GeneralLlm = "asknews/news-summaries"
+    elif is_real_env("PERPLEXITY_API_KEY"):
+        researcher = GeneralLlm(model="perplexity/sonar-pro", temperature=0.1)
+    else:
+        researcher = "free-news-rss"
+
+    if is_real_env("GEMINI_API_KEY"):
+        return (
+            {
+                "default": GeneralLlm(
+                    model="gemini/gemini-2.5-flash",
+                    temperature=0.3,
+                    timeout=60,
+                    allowed_tries=3,
+                ),
+                "summarizer": GeneralLlm(
+                    model="gemini/gemini-2.5-flash",
+                    temperature=0.1,
+                    timeout=60,
+                    allowed_tries=3,
+                ),
+                "researcher": researcher,
+                "parser": GeneralLlm(
+                    model="gemini/gemini-2.5-flash",
+                    temperature=0.1,
+                    timeout=60,
+                    allowed_tries=3,
+                ),
+            },
+            2,
+            1,
+            False,
+        )
+
+    if is_real_env("GITHUB_TOKEN"):
+        github_token = os.environ["GITHUB_TOKEN"].strip()
+        return (
+            {
+                "default": GeneralLlm(
+                    model="openai/openai/gpt-4.1-mini",
+                    api_base=_GITHUB_MODELS_BASE,
+                    api_key=github_token,
+                    temperature=0.3,
+                    timeout=60,
+                    allowed_tries=3,
+                ),
+                "summarizer": GeneralLlm(
+                    model="openai/openai/gpt-4o-mini",
+                    api_base=_GITHUB_MODELS_BASE,
+                    api_key=github_token,
+                    temperature=0.1,
+                    timeout=60,
+                    allowed_tries=3,
+                ),
+                "researcher": researcher,
+                "parser": GeneralLlm(
+                    model="openai/openai/gpt-4o-mini",
+                    api_base=_GITHUB_MODELS_BASE,
+                    api_key=github_token,
+                    temperature=0.1,
+                    timeout=60,
+                    allowed_tries=3,
+                ),
+            },
+            2,
+            1,
+            False,
+        )
+
+    return (None, 5, 2, True)
 
 
 class FallTemplateBot2026(ForecastBot):
@@ -156,6 +280,10 @@ class FallTemplateBot2026(ForecastBot):
                     use_advanced_filters=False,
                 )
                 research = await searcher.invoke(prompt)
+            elif researcher == "free-news-rss":
+                research = await asyncio.to_thread(
+                    _fetch_free_news_rss, question.question_text
+                )
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
             else:
@@ -704,29 +832,23 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
+    # Configure the bot. When OPENROUTER/OPENAI/ANTHROPIC keys are absent,
+    # _build_runtime_config() selects free Gemini or GitHub Models + RSS.
+    llms_cfg, preds_per_report, validation_samples, enable_summarize = (
+        _build_runtime_config()
+    )
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=preds_per_report,
         use_research_summary_to_forecast=False,
+        enable_summarize_research=enable_summarize,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms=llms_cfg,
     )
+    template_bot._structure_output_validation_samples = validation_samples
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
