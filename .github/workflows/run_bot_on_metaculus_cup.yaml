@@ -1,9 +1,7 @@
 name: Forecast on Metaculus Cup
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "0 0 */2 * *" # runs at midnight every 2 days
+  workflow_dispatch: # Manual-only to preserve free-tier LLM quota for prize tournaments
 
 # Add concurrency group to prevent parallel runs
 concurrency:
